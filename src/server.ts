@@ -27,9 +27,12 @@ export class BattleshipServer {
     private handleConnection(ws: WebSocket): void {
         console.log('New WebSocket connection established');
 
-        ws.on('message', (message: string) => {
+        ws.on('message', (message: Buffer) => {
             try {
-                const data: WSMessage = JSON.parse(message);
+                const data = JSON.parse(message.toString()) as WSMessage;
+                if (data.data  && typeof data.data === 'string') {
+                    data.data = JSON.parse(data.data);
+                }
                 console.log('Received command:', data);
                 this.handleMessage(ws, data);
             } catch (error) {
@@ -43,9 +46,7 @@ export class BattleshipServer {
             this.handleDisconnection(ws);
         });
 
-        ws.on('error', (error) => {
-            console.error('WebSocket error:', error);
-        });
+        ws.on('error', (error) => console.error('WebSocket error:', error));
     }
 
     private handleDisconnection(ws: WebSocket): void {
@@ -70,6 +71,9 @@ export class BattleshipServer {
                 break;
             case 'add_user_to_room':
                 this.gameController.handleAddUserToRoom(ws, data);
+                break;
+            case 'single_play':
+                this.gameController.handleCreateBotGame(ws);
                 break;
             case 'add_ships':
                 this.gameController.handleAddShips(ws, data);

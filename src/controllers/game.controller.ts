@@ -10,9 +10,10 @@ import {
     AddUserToRoomRequest,
     AddShipsRequest,
     AttackRequest,
-    RandomAttackRequest
+    RandomAttackRequest, GamePlayer
 } from '../types';
 import { generateId, createEmptyBoard, createEmptyBooleanBoard } from '../utils';
+import { BOT_LAYOUTS } from '../constants';
 
 export class GameController {
     private db: Database;
@@ -63,6 +64,7 @@ export class GameController {
 
     handleCreateRoom(ws: WebSocket): void {
         const player = this.findPlayerByWebSocket(ws);
+
         if (!player) {
             this.sendError(ws, 'Player not found');
             return;
@@ -75,6 +77,31 @@ export class GameController {
 
         this.db.addRoom(room);
         console.log('Room created:', room.roomId);
+
+        this.broadcastRoomUpdate();
+    }
+
+    handleCreateBotGame(ws: WebSocket): void {
+        const player = this.findPlayerByWebSocket(ws);
+
+        if (!player) {
+            this.sendError(ws, 'Player not found');
+            return;
+        }
+
+        const bot: Player = {
+            name: 'bot',
+            password: 'password',
+            index: '',
+            wins: 0,
+        };
+
+        const room: Room = {
+            roomId: generateId(),
+            players: [player, bot]
+        };
+
+        this.createGame(room);
 
         this.broadcastRoomUpdate();
     }
@@ -99,18 +126,19 @@ export class GameController {
 
         room.players.push(player);
 
+        this.createGame(room);
+
+        this.db.removeRoom(room.roomId);
+        this.broadcastRoomUpdate();
+    }
+
+    private createGame(room: Room): void {
         const gameId = generateId();
         room.gameId = gameId;
 
         const game: Game = {
             gameId,
-            players: room.players.map((p) => ({
-                player: p,
-                playerId: generateId(),
-                ships: [],
-                board: createEmptyBoard(),
-                shipsMap: createEmptyBooleanBoard()
-            })),
+            players: this.getGamePlayers(room),
             currentPlayerIndex: 0,
             gameStarted: false,
             gameFinished: false
@@ -133,13 +161,25 @@ export class GameController {
                 console.log('Game created for player:', response);
             }
         });
+    }
 
-        this.db.removeRoom(room.roomId);
-        this.broadcastRoomUpdate();
+    private getGamePlayers(room: Room): GamePlayer[] {
+        return room.players.map(player => {
+            const isBot = player.name === 'bot';
+
+            return {
+                player: player,
+                playerId: isBot ? 'bot' : generateId(),
+                ships: isBot ? BOT_LAYOUTS[Math.floor(Math.random() * BOT_LAYOUTS.length)] : [],
+                board: createEmptyBoard(),
+                shipsMap: createEmptyBooleanBoard()
+            }
+        });
     }
 
     handleAddShips(ws: WebSocket, data: AddShipsRequest): void {
         const game = this.db.getGame(data.gameId);
+
         if (!game) {
             this.sendError(ws, 'Game not found');
             return;
@@ -158,6 +198,11 @@ export class GameController {
 
         gamePlayer.ships = data.ships;
         GameService.placeShipsOnBoard(gamePlayer, data.ships);
+
+        const bot = game.players.find(({playerId}) => playerId === 'bot')
+        if (bot) {
+            GameService.placeShipsOnBoard(bot, gamePlayer.ships);
+        }
 
         console.log('Ships added for player:', data.indexPlayer);
 
@@ -187,7 +232,7 @@ export class GameController {
 
         const attackCell = (data as AttackRequest);
 
-        if (!attackCell.x || !attackCell.y) {
+        if (attackCell.x === undefined && attackCell.y === undefined) {
             const enemyPlayer = game.players[game.currentPlayerIndex === 0 ? 1 : 0];
             const randomCell = GameService.findRandomAttackPosition(enemyPlayer);
 
@@ -203,6 +248,19 @@ export class GameController {
         this.processAttack(game, attackCell);
     }
 
+    private processBotAttack(game: Game): void {
+        setTimeout(() => {
+            const enemyPlayer = game.players[0];
+            const randomCell = GameService.findRandomAttackPosition(enemyPlayer);
+
+            if (!randomCell) {
+                return;
+            }
+
+            this.processAttack(game, randomCell);
+        }, 1000);
+    }
+
     private processAttack(game: Game, { x, y }: { x: number, y: number }): void {
         const currentPlayerIndex = game.currentPlayerIndex;
         const enemyPlayerIndex = currentPlayerIndex === 0 ? 1 : 0;
@@ -210,14 +268,20 @@ export class GameController {
 
         let status: 'miss' | 'killed' | 'shot';
         let shouldContinueTurn = false;
+        let aroundCells: { x: number, y: number }[] = [];
 
-        if (enemyPlayer.board[y][x] === 'ship') {
-            enemyPlayer.board[y][x] = 'hit';
+        if (enemyPlayer.playerId === 'bot') {
+            console.log('enemyPlayer.board', enemyPlayer.board);
+        }
+
+        if (enemyPlayer.board[x][y] === 'ship') {
+            enemyPlayer.board[x][y] = 'hit';
 
             const ship = GameService.findShipAt(enemyPlayer.ships, x, y);
+
             if (ship && GameService.isShipKilled(enemyPlayer, ship)) {
                 status = 'killed';
-                GameService.markAroundKilledShip(enemyPlayer, ship);
+                aroundCells = GameService.markAroundKilledShip(enemyPlayer, ship);
                 shouldContinueTurn = true;
 
                 if (GameService.areAllShipsKilled(enemyPlayer)) {
@@ -229,30 +293,50 @@ export class GameController {
                 shouldContinueTurn = true;
             }
         } else {
-            enemyPlayer.board[y][x] = 'miss';
+            enemyPlayer.board[x][y] = 'miss';
             status = 'miss';
         }
 
+        const currentPlayer = game.players[currentPlayerIndex].playerId;
         const attackResult: AttackResult = {
             position: { x, y },
-            currentPlayer: game.players[currentPlayerIndex].playerId,
+            currentPlayer,
             status
         };
 
         game.players.forEach(gamePlayer => {
-            if (gamePlayer.player.ws) {
-                this.send(gamePlayer.player.ws, {
-                    type: 'attack',
-                    data: attackResult,
-                    id: 0
-                });
+            const ws = gamePlayer.player.ws;
+            if (!ws) {
+                return;
             }
+
+            this.send(ws, {
+                type: 'attack',
+                data: attackResult,
+                id: 0
+            });
+
+            aroundCells.forEach(({ x, y }) => {
+                this.send(ws, {
+                    type: 'attack',
+                    data: { position: { x, y }, currentPlayer, status: 'miss' },
+                    id: 0
+                })
+            })
         });
 
         console.log('Attack result:', attackResult);
 
         if (!shouldContinueTurn) {
             game.currentPlayerIndex = enemyPlayerIndex;
+
+            if (game.players[+!currentPlayerIndex].playerId === 'bot') {
+                this.sendTurnInfo(game);
+                this.processBotAttack(game);
+            }
+        } else if (currentPlayer === 'bot') {
+            this.sendTurnInfo(game);
+            this.processBotAttack(game);
         }
 
         this.sendTurnInfo(game);
@@ -337,6 +421,7 @@ export class GameController {
         };
 
         this.broadcast(message);
+
         console.log('Room update broadcasted:', rooms);
     }
 
@@ -355,21 +440,8 @@ export class GameController {
         };
 
         this.broadcast(message);
+
         console.log('Winners update broadcasted:', winners);
-    }
-
-    private broadcast(message: any): void {
-        for (const [_, ws] of this.db.getPlayerConnections()) {
-            if (ws.readyState === WebSocket.OPEN) {
-                this.send(ws, message);
-            }
-        }
-    }
-
-    private send(ws: WebSocket, message: any): void {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(message));
-        }
     }
 
     private sendError(ws: WebSocket, errorText: string): void {
@@ -378,6 +450,7 @@ export class GameController {
             data: { error: true, errorText },
             id: 0
         };
+
         this.send(ws, message);
     }
 
@@ -387,6 +460,29 @@ export class GameController {
                 return player;
             }
         }
+
         return undefined;
+    }
+
+    private broadcast(message: any): void {
+        for (const [_, ws] of this.db.getPlayerConnections()) {
+            if (ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            this.send(ws, message);
+        }
+    }
+
+    private send(ws: WebSocket, message: any): void {
+        if (ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        if (message.data && typeof message.data !== 'string') {
+            message.data = JSON.stringify(message.data);
+        }
+
+        ws.send(JSON.stringify(message));
     }
 }
